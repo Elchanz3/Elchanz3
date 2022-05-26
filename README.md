@@ -2,4 +2,5 @@
 - 👀 I’m interested in Girls 😏
 - 💞️ I’m looking to collaborate on kernels
 - 📫 How to reach me • telegram : El_chanz  • XDA : snapdragon teaks  
-- ironkernel creator
+- ironkernel dev
+- klimbokernel dev
