@@ -1,6 +1,4 @@
 - 👋 Hi, I’m @Elchanz3
-- 👀 I’m interested in Girls 😏
+- developer
 - 💞️ I’m looking to collaborate on kernels
-- 📫 How to reach me • telegram : El_chanz  • XDA : snapdragon teaks  
-- ironkernel dev
-- klimbokernel dev
+- 📫 How to reach me • telegram : El_chanz  • XDA : snapdragon teaks
