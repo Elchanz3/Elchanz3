@@ -1,4 +1,3 @@
-- 👋 Hi, I’m @Elchanz3
 - developer
 - 💞️ I’m looking to collaborate on kernels
 - 📫 How to reach me • telegram : El_chanz  • XDA : snapdragon teaks
