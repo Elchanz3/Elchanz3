@@ -1,0 +1,32 @@
+name: Shark Manager alpha3 legacy root build
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Materialize Shark Manager alpha3
+        run: |
+          rm -rf project && mkdir project
+          cat ci/alpha3/part* | base64 -d | tar -xzf - -C project
+      - name: Build APK
+        working-directory: project
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Collect APK
+        run: cp project/app/build/outputs/apk/debug/app-debug.apk Shark_Manager_v1.0.0-alpha3-legacy-root-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Shark-Manager-alpha3-legacy-root
+          path: Shark_Manager_v1.0.0-alpha3-legacy-root-debug.apk
+          if-no-files-found: error
