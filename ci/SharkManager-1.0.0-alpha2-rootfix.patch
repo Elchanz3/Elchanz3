@@ -1,0 +1,257 @@
+diff --git a/README.md b/README.md
+index ddb572e..5f4110d 100644
+--- a/README.md
++++ b/README.md
+@@ -54,3 +54,10 @@ app/build/outputs/apk/debug/app-debug.apk
+ ## Assinatura das builds de desenvolvimento
+ 
+ As builds `debug` usam `debug/shark-debug.keystore`, uma chave **somente de desenvolvimento** incluída para que APKs gerados pelo CI mantenham a mesma assinatura e possam atualizar instalações anteriores. Ela nunca deve ser reutilizada para uma release de produção.
++
++
++## alpha2 root fix
++- Root backend moved from raw `ProcessBuilder("su", "-c", ...)` to libsu 6.0.0.
++- KernelSU permission requests are no longer killed after 4 seconds.
++- Negative root results are not cached permanently.
++- Dashboard exposes a retry action and root diagnostic.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 65841bb..245d5f4 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -12,8 +12,8 @@ android {
+         applicationId = "com.sharkkernel.manager"
+         minSdk = 28
+         targetSdk = 33
+-        versionCode = 1000
+-        versionName = "1.0.0-alpha1"
++        versionCode = 1001
++        versionName = "1.0.0-alpha2"
+     }
+ 
+     signingConfigs {
+@@ -57,5 +57,6 @@ dependencies {
+     implementation("androidx.compose.material3:material3")
+     implementation("androidx.compose.material:material-icons-core")
+     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
++    implementation("com.github.topjohnwu.libsu:core:6.0.0")
+     debugImplementation("androidx.compose.ui:ui-tooling")
+ }
+diff --git a/app/src/main/java/com/sharkkernel/manager/core/RootShell.kt b/app/src/main/java/com/sharkkernel/manager/core/RootShell.kt
+index 3944142..b62b245 100644
+--- a/app/src/main/java/com/sharkkernel/manager/core/RootShell.kt
++++ b/app/src/main/java/com/sharkkernel/manager/core/RootShell.kt
+@@ -1,34 +1,66 @@
+ package com.sharkkernel.manager.core
+ 
++import com.topjohnwu.superuser.Shell
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+-import java.io.BufferedReader
+-import java.io.InputStreamReader
+-import java.util.concurrent.TimeUnit
+ 
+-/** Minimal, dependency-free KernelSU/Magisk compatible root executor. */
++/**
++ * Shared root executor backed by libsu.
++ *
++ * KernelSU/Magisk expose root through an su shell. Keeping one libsu shell avoids
++ * racing several short-lived `su -c` processes while the permission dialog is
++ * still being handled.
++ */
+ object RootShell {
+     data class Result(val code: Int, val out: String, val err: String) {
+         val ok: Boolean get() = code == 0
+     }
+ 
+-    suspend fun exec(command: String, timeoutMs: Long = 4_000): Result = withContext(Dispatchers.IO) {
++    data class Probe(
++        val granted: Boolean,
++        val detail: String
++    )
++
++    suspend fun exec(command: String): Result = withContext(Dispatchers.IO) {
+         try {
+-            val process = ProcessBuilder("su", "-c", command).start()
+-            val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+-            if (!finished) {
+-                process.destroyForcibly()
+-                return@withContext Result(-1, "", "timeout")
+-            }
+-            val out = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }.trim()
+-            val err = BufferedReader(InputStreamReader(process.errorStream)).use { it.readText() }.trim()
+-            Result(process.exitValue(), out, err)
++            val result = Shell.cmd(command).exec()
++            Result(
++                code = result.code,
++                out = result.out.joinToString("\n").trim(),
++                err = result.err.joinToString("\n").trim()
++            )
+         } catch (t: Throwable) {
+             Result(-1, "", t.message.orEmpty())
+         }
+     }
+ 
+-    suspend fun granted(): Boolean = exec("id -u").let { it.ok && it.out.trim() == "0" }
++    suspend fun probe(): Probe = withContext(Dispatchers.IO) {
++        try {
++            val shell = Shell.getShell()
++            if (!shell.isRoot) {
++                return@withContext Probe(false, "su shell sem UID 0")
++            }
++            val result = Shell.cmd("id -u").exec()
++            val uid = result.out.firstOrNull()?.trim().orEmpty()
++            if (result.isSuccess && uid == "0") {
++                Probe(true, "KernelSU/libsu: UID 0")
++            } else {
++                val reason = result.err.joinToString(" ").trim().ifEmpty {
++                    "id -u retornou '${uid.ifEmpty { "sem saída" }}' (code=${result.code})"
++                }
++                Probe(false, reason)
++            }
++        } catch (t: Throwable) {
++            Probe(false, t.message ?: t.javaClass.simpleName)
++        }
++    }
++
++    suspend fun granted(): Boolean = probe().granted
++
++    /** Forces libsu to discard the current shell and request a fresh one. */
++    fun reset() {
++        try { Shell.getCachedShell()?.close() } catch (_: Throwable) {}
++    }
+ 
+     fun q(value: String): String = "'" + value.replace("'", "'\\''") + "'"
+ }
+diff --git a/app/src/main/java/com/sharkkernel/manager/data/DeviceRepository.kt b/app/src/main/java/com/sharkkernel/manager/data/DeviceRepository.kt
+index 6ee8734..de0d48e 100644
+--- a/app/src/main/java/com/sharkkernel/manager/data/DeviceRepository.kt
++++ b/app/src/main/java/com/sharkkernel/manager/data/DeviceRepository.kt
+@@ -1,17 +1,46 @@
+ package com.sharkkernel.manager.data
+ 
+ import android.os.Build
++import android.os.SystemClock
+ import com.sharkkernel.manager.core.RootShell
+ import com.sharkkernel.manager.model.DeviceState
+ 
+ object DeviceRepository {
+     @Volatile private var cached: DeviceState? = null
++    @Volatile private var cachedAtMs: Long = 0L
++
+     suspend fun read(): DeviceState {
+-        cached?.let { return it }
+-        val root = RootShell.granted()
+-        val probe = RootShell.exec("[ -d /sys/kernel/shark_g3d_oc ] || [ -d /sys/kernel/debug/shark_soc ] || [ -d /sys/kernel/fvmap_interface ]")
++        val now = SystemClock.elapsedRealtime()
++        cached?.let { state ->
++            val ttl = if (state.root) 30_000L else 1_500L
++            if (now - cachedAtMs < ttl) return state
++        }
++
++        val rootProbe = RootShell.probe()
++        val probe = if (rootProbe.granted) {
++            RootShell.exec("[ -d /sys/kernel/shark_g3d_oc ] || [ -d /sys/kernel/debug/shark_soc ] || [ -d /sys/kernel/fvmap_interface ]")
++        } else null
+         val deviceOk = Build.MODEL.startsWith("SM-S721", true) || Build.DEVICE.equals("r12s", true)
+         val socOk = Build.BOARD.equals("s5e9945", true) || Build.HARDWARE.equals("s5e9945", true)
+-        return DeviceState(root, root && deviceOk && socOk && probe.ok, Build.MODEL, Build.DEVICE, Build.HARDWARE, System.getProperty("os.version").orEmpty()).also { cached = it }
++        return DeviceState(
++            root = rootProbe.granted,
++            rootDetail = rootProbe.detail,
++            supported = rootProbe.granted && deviceOk && socOk && probe?.ok == true,
++            model = Build.MODEL,
++            device = Build.DEVICE,
++            hardware = Build.HARDWARE,
++            kernel = System.getProperty("os.version").orEmpty()
++        ).also {
++            cached = it
++            cachedAtMs = now
++        }
++    }
++
++    fun invalidateRoot() {
++        cached = null
++        cachedAtMs = 0L
++        RootShell.reset()
+     }
+ }
+diff --git a/app/src/main/java/com/sharkkernel/manager/model/Models.kt b/app/src/main/java/com/sharkkernel/manager/model/Models.kt
+index b848c91..ac3892f 100644
+--- a/app/src/main/java/com/sharkkernel/manager/model/Models.kt
++++ b/app/src/main/java/com/sharkkernel/manager/model/Models.kt
+@@ -56,6 +56,7 @@ data class PmicSnapshot(val microvolts: Map<PmicRail, Long> = emptyMap(), val so
+ 
+ data class DeviceState(
+     val root: Boolean = false,
++    val rootDetail: String = "",
+     val supported: Boolean = false,
+     val model: String = android.os.Build.MODEL.orEmpty(),
+     val device: String = android.os.Build.DEVICE.orEmpty(),
+diff --git a/app/src/main/java/com/sharkkernel/manager/ui/SharkApp.kt b/app/src/main/java/com/sharkkernel/manager/ui/SharkApp.kt
+index 24c0935..a5529e5 100644
+--- a/app/src/main/java/com/sharkkernel/manager/ui/SharkApp.kt
++++ b/app/src/main/java/com/sharkkernel/manager/ui/SharkApp.kt
+@@ -54,7 +54,7 @@ private data class NavItem(val route:String,val label:String,val icon:ImageVecto
+         Scaffold(topBar={TopAppBar(title={Text(titleFor(route))},navigationIcon={IconButton(onClick={ scope.launch { drawer.open() } }){Icon(Icons.Filled.Menu,"Menu")}},actions={IconButton(onClick=vm::refreshNow){Icon(Icons.Filled.Refresh,"Atualizar")}})}) { pad ->
+             Box(Modifier.padding(pad)) {
+                 NavHost(navController=nav,startDestination="dashboard") {
+-                    composable("dashboard"){DashboardScreen(state)}
++                    composable("dashboard"){DashboardScreen(state, vm::retryRoot)}
+                     composable("cpu"){CpuScreen(state,vm)}
+                     composable("gpu"){GpuScreen(state,vm)}
+                     composable("dsu"){DsuScreen(state,vm)}
+diff --git a/app/src/main/java/com/sharkkernel/manager/ui/SharkViewModel.kt b/app/src/main/java/com/sharkkernel/manager/ui/SharkViewModel.kt
+index 76becb8..bb1a7ea 100644
+--- a/app/src/main/java/com/sharkkernel/manager/ui/SharkViewModel.kt
++++ b/app/src/main/java/com/sharkkernel/manager/ui/SharkViewModel.kt
+@@ -31,6 +31,11 @@ class SharkViewModel(app: Application) : AndroidViewModel(app) {
+         }
+     }
+     fun refreshNow() = viewModelScope.launch { _state.value = SharkRepository.snapshot(_state.value) }
++    fun retryRoot() = viewModelScope.launch {
++        DeviceRepository.invalidateRoot()
++        _state.value = _state.value.copy(refreshing = true)
++        _state.value = SharkRepository.snapshot(_state.value)
++    }
+ 
+     fun cpuMin(policy: CpuPolicy, khz: Long) = viewModelScope.launch {
+         if (CpuRepository.setMin(policy, khz)) settings.saveCpu(policy.name, min = khz); refreshNow()
+diff --git a/app/src/main/java/com/sharkkernel/manager/ui/screens/DashboardScreen.kt b/app/src/main/java/com/sharkkernel/manager/ui/screens/DashboardScreen.kt
+index 4bc7229..497adfb 100644
+--- a/app/src/main/java/com/sharkkernel/manager/ui/screens/DashboardScreen.kt
++++ b/app/src/main/java/com/sharkkernel/manager/ui/screens/DashboardScreen.kt
+@@ -12,15 +12,20 @@ import com.sharkkernel.manager.model.SharkState
+ import com.sharkkernel.manager.ui.HeroMetric
+ import com.sharkkernel.manager.ui.SharkCard
+ 
+-@Composable fun DashboardScreen(s: SharkState) {
++@Composable fun DashboardScreen(s: SharkState, onRetryRoot: () -> Unit) {
+     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement=Arrangement.spacedBy(14.dp)) {
+         SharkCard("Shark Manager", "${s.device.model} • ${s.device.hardware}") {
+             Text(s.device.kernel, color=MaterialTheme.colorScheme.onSurfaceVariant)
+             Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+-                AssistChip(onClick={}, label={Text(if(s.device.root) "ROOT OK" else "ROOT AUSENTE")})
++                AssistChip(onClick=if (s.device.root) ({}) else onRetryRoot, label={Text(if(s.device.root) "ROOT OK" else "TENTAR ROOT")})
+                 AssistChip(onClick={}, label={Text(if(s.device.supported) "SHARK ACTIVE" else "CHECK")})
+             }
+-            if (!s.device.supported) Text("O app espera r12s/s5e9945 com uma interface SharkKernel disponível.", color=MaterialTheme.colorScheme.error)
++            if (!s.device.root) {
++                Text("Root não foi obtido: ${s.device.rootDetail.ifBlank { "sem diagnóstico" }}", color=MaterialTheme.colorScheme.error)
++                Text("Toque em TENTAR ROOT para abrir/revalidar a sessão do KernelSU.", color=MaterialTheme.colorScheme.onSurfaceVariant)
++            } else if (!s.device.supported) {
++                Text("Root OK, mas nenhuma interface SharkKernel esperada foi encontrada.", color=MaterialTheme.colorScheme.error)
++            }
+         }
+         s.cpu.forEach { p ->
+             HeroMetric(p.name, microarch(p.name)+" • CPU ${p.cpus}", Format.frequency(p.currentKhz), trailing="${Format.frequency(p.minKhz)} ↔ ${Format.frequency(p.maxKhz)} • ${p.governor}")
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 348f324..a117ad7 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -10,6 +10,7 @@ dependencyResolutionManagement {
+     repositories {
+         google()
+         mavenCentral()
++        maven("https://maven.scijava.org/content/repositories/public/")
+     }
+ }
+ rootProject.name = "SharkManager"
