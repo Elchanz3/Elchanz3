@@ -51,18 +51,21 @@ object RootShell {
         if (su.denied || su.closed) {
             return@withContext Probe(false, su.lastError.ifBlank { "não foi possível abrir a shell su" })
         }
-        val result = su.runCommand("echo /testRoot/")
-        if (!su.denied && result.out.lineSequence().any { it.trim() == "/testRoot/" }) {
+
+        su.runCommand("echo /testRoot/")
+        // Match legacy RootUtils.rootAccess() exactly: after the harmless command,
+        // root is considered available as long as the interactive su session did
+        // not mark itself denied. No UID check and no output-content requirement.
+        if (!su.denied && !su.closed) {
             Probe(true, "RootUtils legado: shell su interativa OK")
         } else {
-            Probe(false, su.lastError.ifBlank {
-                result.err.ifBlank { "a shell su não respondeu ao teste /testRoot/" }
-            })
+            Probe(false, su.lastError.ifBlank { "acesso su negado" })
         }
     }
 
     suspend fun granted(): Boolean = probe().granted
 
+    /** Force a fresh permission negotiation on the next access. */
     fun reset() {
         sessionLock.lock()
         try {
@@ -90,6 +93,7 @@ object RootShell {
 
         init {
             try {
+                // Intentionally identical to the old RootUtils.SU constructor.
                 process = Runtime.getRuntime().exec("su")
                 writer = BufferedWriter(OutputStreamWriter(process!!.outputStream))
                 reader = BufferedReader(InputStreamReader(process!!.inputStream))
@@ -102,14 +106,19 @@ object RootShell {
 
         fun runCommand(command: String): Result {
             if (closed) return Result(-1, "", lastError.ifBlank { "su shell fechada" })
+
             ioLock.lock()
             try {
                 val w = writer ?: return fail("su stdin indisponível")
                 val r = reader ?: return fail("su stdout indisponível")
                 val token = "__SHARK_CALLBACK_${System.nanoTime()}_${sequence++}__"
+
+                // The first line mirrors legacy RootUtils. The callback below is
+                // prefixed by a newline so even sysfs files without a trailing
+                // newline cannot swallow the token into their output.
                 w.write(command)
                 w.write("\n")
-                w.write("__shark_rc=$?; echo ${token}\$__shark_rc")
+                w.write("__shark_rc=$?; printf '\\n${token}%s\\n' \"\$__shark_rc\"")
                 w.write("\n")
                 w.flush()
 
