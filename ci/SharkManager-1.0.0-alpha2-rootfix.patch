@@ -1,18 +1,3 @@
-diff --git a/README.md b/README.md
-index ddb572e..5f4110d 100644
---- a/README.md
-+++ b/README.md
-@@ -54,3 +54,10 @@ app/build/outputs/apk/debug/app-debug.apk
- ## Assinatura das builds de desenvolvimento
- 
- As builds `debug` usam `debug/shark-debug.keystore`, uma chave **somente de desenvolvimento** incluída para que APKs gerados pelo CI mantenham a mesma assinatura e possam atualizar instalações anteriores. Ela nunca deve ser reutilizada para uma release de produção.
-+
-+
-+## alpha2 root fix
-+- Root backend moved from raw `ProcessBuilder("su", "-c", ...)` to libsu 6.0.0.
-+- KernelSU permission requests are no longer killed after 4 seconds.
-+- Negative root results are not cached permanently.
-+- Dashboard exposes a retry action and root diagnostic.
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
 index 65841bb..245d5f4 100644
 --- a/app/build.gradle.kts
@@ -114,7 +99,6 @@ index 3944142..b62b245 100644
 +
 +    suspend fun granted(): Boolean = probe().granted
 +
-+    /** Forces libsu to discard the current shell and request a fresh one. */
 +    fun reset() {
 +        try { Shell.getCachedShell()?.close() } catch (_: Throwable) {}
 +    }
